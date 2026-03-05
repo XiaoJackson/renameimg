@@ -8,10 +8,10 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QGraphicsView, QGraphics
                              QLineEdit, QComboBox, QColorDialog, QMessageBox, QFrame,
                              QSlider, QStyle, QListWidget, QCheckBox)
 from PyQt5.QtCore import Qt, QRectF, QTimer, pyqtSignal
-from PyQt5.QtGui import QPixmap, QFont, QColor, QImage, QPainter, QPen, QBrush, QPainterPath, QFontMetrics
+from PyQt5.QtGui import QPixmap, QFont, QColor, QImage, QPainter, QPen, QBrush, QPainterPath, QFontMetrics, QTransform
 
 
-# === 1. 自定义点击标签  ===
+# === 1. 自定义点击标签 (用于彩蛋) ===
 class SecretLabel(QLabel):
     secret_triggered = pyqtSignal()
 
@@ -178,6 +178,14 @@ class WatermarkApp(QMainWindow):
         line1.setFrameShadow(QFrame.Sunken)
         controls_layout.addWidget(line1)
 
+        # === 新增：图片操作区域 ===
+        hbox_img_ops = QHBoxLayout()
+        self.btn_rotate_img = QPushButton("图片旋转")
+        self.btn_rotate_img.setFixedHeight(35)
+        self.btn_rotate_img.clicked.connect(self.rotate_image_clockwise)  # 连接新函数
+        hbox_img_ops.addWidget(self.btn_rotate_img)
+        controls_layout.addLayout(hbox_img_ops)
+
         # 2. 水印设置
         controls_layout.addWidget(QLabel("水印内容 (同步文件名):"))
         self.edt_watermark = QLineEdit()
@@ -338,7 +346,7 @@ class WatermarkApp(QMainWindow):
         title = "关于本软件"
         content = """
         <h3>应用名称：拍了个器-Rename</h3>
-        <p><b>版本：</b>Beta 0.3</p>
+        <p><b>版本：</b>Beta 0.4</p>
         <p><b>作者：</b>Xiaojacksonwww</p>
         """
         QMessageBox.about(self, title, content)
@@ -463,6 +471,32 @@ class WatermarkApp(QMainWindow):
         self.update_watermark_style()
         self.fit_image_in_view()
 
+    def rotate_image_clockwise(self):
+        """顺时针旋转图片90度，并适配场景"""
+        if not self.pixmap_item:
+            return
+
+        # 1. 获取当前图片并旋转
+        current_pix = self.pixmap_item.pixmap()
+        transform = QTransform().rotate(90)
+        # 使用 SmoothTransformation 保证旋转后边缘平滑
+        new_pix = current_pix.transformed(transform, Qt.SmoothTransformation)
+
+        # 2. 更新场景中的图片
+        self.pixmap_item.setPixmap(new_pix)
+
+        # 3. 更新场景大小以适应新图片尺寸
+        rect = QRectF(new_pix.rect())
+        self.scene.setSceneRect(rect)
+
+        # 4. 如果启用了"锁定底部"，旋转后长宽互换，必须重新计算水印位置
+        if self.chk_lock_bottom.isChecked():
+            self.move_to_bottom_center()
+
+        # 5. 适配视图
+        self.fit_image_in_view()
+
+
     def fit_image_in_view(self, apply_transform=True):
         if self.pixmap_item and self.zoom_slider.value() == 0 and apply_transform:
             self.view.fitInView(self.scene.sceneRect(), Qt.KeepAspectRatio)
@@ -483,7 +517,6 @@ class WatermarkApp(QMainWindow):
         if state == Qt.Checked:
             self.move_to_bottom_center()
 
-    # === 居中置底逻辑 ===
     def move_to_bottom_center(self):
         if not self.text_item or not self.pixmap_item:
             return
@@ -496,11 +529,14 @@ class WatermarkApp(QMainWindow):
         img_w = img_rect.width()
         img_h = img_rect.height()
 
-        # 1. 为了计算准确，先归零旋转
-        self.combo_rotate.blockSignals(True)
-        self.combo_rotate.setCurrentText("0")
+        # === 关键修复 1: 获取当前用户选中的角度 ===
+        # 不要像之前那样去修改 combo_rotate 的值，而是读取它
+        current_angle_text = self.combo_rotate.currentText()
+        current_angle = int(current_angle_text) if current_angle_text.isdigit() else 0
+
+        # === 关键修复 2: 仅在对象层面临时归零 (不改 UI) ===
+        # 为了准确计算文字如果不旋转时的宽度，我们临时把它转正
         self.text_item.setRotation(0)
-        self.combo_rotate.blockSignals(False)
 
         # 2. 检查宽度，防止文字超宽
         current_size = self.slider_size.value()
@@ -512,13 +548,12 @@ class WatermarkApp(QMainWindow):
         # 允许的最大宽度 (留点边距)
         max_allowed_width = img_w * 0.96
 
-        # 如果文字比图片还宽，才强制缩小；否则保持设置的大小
+        # 如果文字比图片还宽，才强制缩小；否则保持用户设置的大小
         if text_width > max_allowed_width:
             ratio = max_allowed_width / text_width
             new_size = int(current_size * ratio)
             new_size = max(10, new_size)  # 最小保护
 
-            # 更新滑条和字体
             self.slider_size.blockSignals(True)
             self.slider_size.setValue(new_size)
             self.slider_size.blockSignals(False)
@@ -533,7 +568,6 @@ class WatermarkApp(QMainWindow):
         # 3. 重新获取精确尺寸
         fm = QFontMetrics(font)
         real_text_width = fm.horizontalAdvance(text_content)
-        real_text_height = fm.height()
 
         # 4. 计算坐标 (居中，紧贴底部)
         x = (img_w - real_text_width) / 2
@@ -541,13 +575,15 @@ class WatermarkApp(QMainWindow):
         # 底部边距：高度的 1% (紧贴)
         margin = img_h * 0.01
 
-        # y 坐标 = 图片高度 - 文字高度 - 边距
-        # 注意：QGraphicsSimpleTextItem 的 boundingRect 通常包含了一些上下的 padding
-        # 使用 boundingRect().height() 通常比 fm.height() 更能反映在 scene 中的占用
+        # 计算 Y 轴位置
         rect_h = self.text_item.boundingRect().height()
         y = img_h - rect_h - margin
 
         self.text_item.setPos(x, y)
+
+        # === 关键修复 3: 恢复用户设定的角度 ===
+        # 位置计算完毕后，重新应用旋转角度
+        self.text_item.setRotation(current_angle)
         self.update_transform_origin()
 
     def update_watermark_style(self):
@@ -581,6 +617,7 @@ class WatermarkApp(QMainWindow):
             self.watermark_color = color
             self.btn_color.setStyleSheet(f"background-color: {color.name()}; color: white; border-radius: 4px;")
             self.update_watermark_style()
+
 
     def prev_image(self):
         if self.current_index > 0:
